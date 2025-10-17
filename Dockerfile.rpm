@@ -1,0 +1,27 @@
+FROM fedora:39
+
+# Install build dependencies
+RUN dnf install -y \
+    golang \
+    rpm-build \
+    rpmdevtools \
+    gcc \
+    make \
+    pkgconfig \
+    ffmpeg-free-devel \
+    git \
+    && dnf clean all
+
+WORKDIR /workspace
+
+# Copy source code
+COPY . .
+
+# Build script
+COPY build-rpm.sh /build-rpm.sh
+RUN chmod +x /build-rpm.sh
+
+CMD ["/build-rpm.sh"]
+
+#  docker build -f Dockerfile.rpm -t steam-query-rpm-builder .
+# docker run --rm -v $(pwd)/output:/output -e VERSION=0.1.0 -e RELEASE=1 steam-query-rpm-builder
