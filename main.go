@@ -132,6 +132,7 @@ func (fm *FileManager) ExtractMasterPlaylists() error {
 		return err
 	}
 
+	fmt.Printf("data: %+v\n", data)
 	// extract base url and master playlist name
 	// https://host/path/to/app/hls_264_master.m3u8?t=1733940241
 	lastSlashIdx := strings.LastIndex(data[0].HLSManifest, "/")
