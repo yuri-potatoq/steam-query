@@ -1,5 +1,5 @@
 {
-  description = "Steam Query - Multi-format builds";
+  description = "Steam Query - Go application with FFmpeg";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -10,153 +10,174 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        
-        # Base package
-        steam-query = pkgs.buildGoModule {
-          pname = "steam-query";
-          version = "0.1.0";
-
-          src = pkgs.lib.cleanSourceWith {
-            src = ./.;
-            filter = path: type:
-              let baseName = baseNameOf path;
-              in !(baseName == "result");
-          };
-
-          vendorHash = "sha256-Z78u1XjvL+Zoao2j8MbA1BjuOZjfSluCiFzI8f0OSiI=";
-
-          nativeBuildInputs = with pkgs; [ pkg-config ];
-          buildInputs = with pkgs; [ ffmpeg-headless.dev ];
-
-          preBuild = ''
-            export CGO_ENABLED=1
-            export CGO_CFLAGS="$(pkg-config --cflags libavformat libavcodec libavutil)"
-            export CGO_LDFLAGS="$(pkg-config --libs libavformat libavcodec libavutil)"
-          '';
-
-          ldflags = [ "-s" "-w" ];
-
-          meta = with pkgs.lib; {
-            description = "Steam Query application";
-            homepage = "https://github.com/yuri-potatoq/steam-query";
-            license = licenses.mit;
-            maintainers = [ ];
-          };
-        };
+        ffmpeg-minimal = pkgs.ffmpeg-headless;
       in
       {
         packages = {
-          default = steam-query;
+          # Standard dynamic binary (works only on NixOS or with Nix installed)
+          default = pkgs.buildGoModule {
+            pname = "steam-query";
+            version = "0.1.0";
 
-          # Docker/OCI container
-          docker = pkgs.dockerTools.buildLayeredImage {
-            name = "steam-query";
-            tag = "latest";
-            
-            contents = [
-              steam-query
-              pkgs.ffmpeg-headless
-              pkgs.cacert  # For HTTPS
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter = path: type:
+                let baseName = baseNameOf path;
+                in !(baseName == "result");
+            };
+
+            vendorHash = "sha256-XBo8pZGzvma8AM/KJdVI30E39ho+T2+daBxNsmvJeHI=";
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
             ];
-            
-            config = {
-              Cmd = [ "${steam-query}/bin/steam-query" ];
-              Env = [
-                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              ];
+
+            buildInputs = [
+              ffmpeg-minimal.dev
+            ];
+
+            preBuild = ''
+              export CGO_ENABLED=1
+              export CGO_CFLAGS="$(pkg-config --cflags libavformat libavcodec libavutil)"
+              export CGO_LDFLAGS="$(pkg-config --libs libavformat libavcodec libavutil)"
+            '';
+
+            ldflags = [ "-s" "-w" ];
+
+            meta = with pkgs.lib; {
+              description = "Steam Query application (Nix dynamic)";
             };
           };
 
-          # Debian/Ubuntu .deb package
-          deb = pkgs.stdenv.mkDerivation {
-            name = "steam-query-deb";
-            
-            buildInputs = [ pkgs.dpkg ];
-            
-            src = steam-query;
-            
+          # Portable binary with bundled libraries (works on any x86_64 Linux)
+          portable = pkgs.stdenv.mkDerivation {
+            pname = "steam-query-portable";
+            version = "0.1.0";
+
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter = path: type:
+                let baseName = baseNameOf path;
+                in !(baseName == "result" || baseName == "flake.nix" || baseName == "flake.lock");
+            };
+
+            nativeBuildInputs = with pkgs; [
+              go
+              pkg-config
+              autoPatchelfHook
+              makeWrapper
+            ];
+
+            buildInputs = [
+              ffmpeg-minimal
+              pkgs.stdenv.cc.cc.lib
+            ];
+
             buildPhase = ''
-              mkdir -p deb/DEBIAN deb/usr/bin
+              export HOME=$TMPDIR
+              export GOCACHE=$TMPDIR/go-cache
+              export GOPATH=$TMPDIR/go
+              export GO111MODULE=on
+              export CGO_ENABLED=1
+              export CGO_CFLAGS="$(pkg-config --cflags libavformat libavcodec libavutil)"
+              export CGO_LDFLAGS="$(pkg-config --libs libavformat libavcodec libavutil)"
               
-              # Control file
-              cat > deb/DEBIAN/control << EOF
-              Package: steam-query
-              Version: 0.1.0
-              Section: utils
-              Priority: optional
-              Architecture: amd64
-              Depends: ffmpeg
-              Maintainer: Your Name <your@email.com>
-              Description: Steam Query application
-               A tool for querying Steam data
-              EOF
-              
-              # Copy binary
-              cp ${steam-query}/bin/steam-query deb/usr/bin/
-              
-              # Build package
-              dpkg-deb --build deb
+              echo "Building portable binary..."
+              go build -v -ldflags "-s -w" -o steam-query .
             '';
-            
+
             installPhase = ''
-              mkdir -p $out
-              cp deb.deb $out/steam-query_0.1.0_amd64.deb
+              mkdir -p $out/bin $out/lib
+              
+              # Copy the binary
+              cp steam-query $out/bin/
+              
+              # Copy FFmpeg libraries and their dependencies
+              echo "Collecting FFmpeg libraries..."
+              for lib in ${ffmpeg-minimal}/lib/*.so*; do
+                if [ -f "$lib" ]; then
+                  cp -L "$lib" $out/lib/
+                fi
+              done
+              
+              # Collect all transitive dependencies
+              echo "Collecting transitive dependencies..."
+              for lib in $(ldd ${ffmpeg-minimal}/lib/libavformat.so* | grep "=> /" | awk '{print $3}'); do
+                cp -L "$lib" $out/lib/ 2>/dev/null || true
+              done
+              
+              for lib in $(ldd ${ffmpeg-minimal}/lib/libavcodec.so* | grep "=> /" | awk '{print $3}'); do
+                cp -L "$lib" $out/lib/ 2>/dev/null || true
+              done
+              
+              for lib in $(ldd ${ffmpeg-minimal}/lib/libavutil.so* | grep "=> /" | awk '{print $3}'); do
+                cp -L "$lib" $out/lib/ 2>/dev/null || true
+              done
+              
+              # Set RPATH to look in the lib directory relative to binary
+              patchelf --set-rpath '$ORIGIN/../lib' $out/bin/steam-query
+              
+              # Create a wrapper script that sets LD_LIBRARY_PATH
+              mv $out/bin/steam-query $out/bin/.steam-query-wrapped
+              makeWrapper $out/bin/.steam-query-wrapped $out/bin/steam-query \
+                --prefix LD_LIBRARY_PATH : $out/lib
+              
+              echo "Portable package created with $(ls $out/lib | wc -l) libraries"
             '';
+
+            meta = with pkgs.lib; {
+              description = "Steam Query application (portable with bundled libs)";
+            };
           };
 
-          # RPM package for Fedora/RHEL
-          rpm = pkgs.stdenv.mkDerivation {
-            name = "steam-query-rpm";
-            
-            nativeBuildInputs = [ pkgs.rpm ];
-            
-            src = steam-query;
-            
-            buildPhase = ''
-              mkdir -p rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-              mkdir -p rpm/BUILD/usr/bin
-              
-              # Copy binary
-              cp ${steam-query}/bin/steam-query rpm/BUILD/usr/bin/
-              
-              # Create spec file
-              cat > rpm/SPECS/steam-query.spec << EOF
-              Name:           steam-query
-              Version:        0.1.0
-              Release:        1%{?dist}
-              Summary:        Steam Query application
-              License:        MIT
-              Requires:       ffmpeg-free
-              
-              %description
-              A tool for querying Steam data
-              
-              %install
-              mkdir -p %{buildroot}/usr/bin
-              cp ${steam-query}/bin/steam-query %{buildroot}/usr/bin/
-              
-              %files
-              /usr/bin/steam-query
-              EOF
-              
-              # Build RPM
-              rpmbuild --define "_topdir $(pwd)/rpm" -bb rpm/SPECS/steam-query.spec
-            '';
-            
-            installPhase = ''
-              mkdir -p $out
-              cp rpm/RPMS/x86_64/*.rpm $out/
-            '';
-          };
+          # Musl static (most portable, single binary)
+          musl-static = pkgs.pkgsMusl.buildGoModule {
+            pname = "steam-query-musl";
+            version = "0.1.0";
 
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter = path: type:
+                let baseName = baseNameOf path;
+                in !(baseName == "result");
+            };
+
+            vendorHash = "sha256-XBo8pZGzvma8AM/KJdVI30E39ho+T2+daBxNsmvJeHI=";
+
+            nativeBuildInputs = with pkgs.pkgsMusl; [
+              pkg-config
+            ];
+
+            buildInputs = with pkgs.pkgsMusl; [
+              ffmpeg-headless.dev
+            ];
+
+            preBuild = ''
+              export CGO_ENABLED=1
+              export CGO_CFLAGS="$(pkg-config --cflags libavformat libavcodec libavutil)"
+              export CGO_LDFLAGS="$(pkg-config --libs libavformat libavcodec libavutil)"
+            '';
+
+            ldflags = [
+              "-s"
+              "-w"
+              "-linkmode"
+              "external"
+              "-extldflags"
+              "-static"
+            ];
+
+            meta = with pkgs.lib; {
+              description = "Steam Query application (musl static)";
+            };
+          };
         };
 
-        # Dev shell
         devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-            go
-            pkg-config
-            ffmpeg-headless.dev
+          buildInputs = [
+            pkgs.go
+            pkgs.pkg-config
+            ffmpeg-minimal.dev
           ];
 
           shellHook = ''
