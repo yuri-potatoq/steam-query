@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 
 	"github.com/Eyevinn/hls-m3u8/m3u8"
@@ -24,14 +26,35 @@ var (
 	tmpVideoFile = "video.m4s"
 )
 
-func main() {
-	gamePageUrl := flag.String("game-page", "", `url for steam game page`)
-	flag.Parse()
+func getEnvString(name string, dft ...string) string {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		if len(dft) >= 1 {
+			return dft[0]
+		}
+		log.Fatalf("can't find environment variable for [%s]", name)
+	}
+	return value
+}
 
+func main() {
 	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("recovered error %v\n", err)
+		}
+
+		fmt.Println("removing temporary files...")
 		os.Remove(tmpAudioFile)
 		os.Remove(tmpVideoFile)
 	}()
+
+	gamePageUrl := flag.String("game-page", "", `url for steam game page.`)
+	outputDir := flag.String("output-dir", getEnvString("OUTPUT_DIR", "./"), `output directory of result file. (default: ./`)
+	flag.Parse()
+
+	if *gamePageUrl == "" {
+		*gamePageUrl = getEnvString("GAME_PAGE")
+	}
 
 	fm, err := SetupFileManager(*gamePageUrl, tmpVideoFile, tmpAudioFile)
 	if err != nil {
@@ -64,10 +87,28 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := TransformMedia(tmpVideoFile, tmpAudioFile, "./output.mp4"); err != nil {
+	outputPath, err := getAbsoluteOutputPath(*outputDir)
+	if err != nil {
 		log.Fatal(err)
 	}
 
+	if err := TransformMedia(tmpVideoFile, tmpAudioFile, outputPath); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func getAbsoluteOutputPath(outPath string) (string, error) {
+	outPath = path.Clean(outPath)
+	info, err := os.Stat(outPath)
+	if err != nil {
+		return "", err
+	}
+
+	if !info.IsDir() {
+		return "", errors.New("can't use provide directory")
+	}
+
+	return path.Join(outPath, "output.mp4"), nil
 }
 
 type FileManager struct {
