@@ -21,8 +21,13 @@ RUN CGO_ENABLED=1 \
     CGO_LDFLAGS="$(pkg-config --libs libavformat libavcodec libavutil)" \
     go build -v -ldflags "-s -w" -o steam-query .
 
+ENV OUTPUT_DIR="/app/output"
+RUN mkdir /app/output
+
 ENTRYPOINT ["/app/steam-query"]
 
+
+#TODO: fix interative mode
 # Run with:
 # docker build -f Dockerfile -t steam-query .
-# docker run -v ./output:/app/output steam-query -game-page https://store.steampowered.com/app/1063730/New_World_Aeternum/
+# docker run -it -v ./output:/app/output steam-query -game-page <game-url>

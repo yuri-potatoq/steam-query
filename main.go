@@ -1,6 +1,8 @@
 package main
 
 import (
+	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,11 +12,15 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Eyevinn/hls-m3u8/m3u8"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
+	"golang.org/x/sync/errgroup"
 )
 
 type DataProps struct {
@@ -37,8 +43,38 @@ func getEnvString(name string, dft ...string) string {
 	return value
 }
 
+func chooseResolution(playlists []*videoPlaylist) *m3u8.MediaPlaylist {
+	var optionNumber int
+	fmt.Println("Select output resolution option:")
+
+	// sort playlist by resolution
+	slices.SortFunc(playlists, func(a, b *videoPlaylist) int {
+		aNumber, _ := strconv.Atoi(strings.SplitN(a.resolution, "x", 1)[0])
+		bNumber, _ := strconv.Atoi(strings.SplitN(b.resolution, "x", 1)[0])
+
+		return cmp.Compare(aNumber, bNumber)
+	})
+	for i, pl := range playlists {
+		fmt.Printf(" [%d] %s\n", i+1, pl.resolution)
+	}
+
+	for {
+		fmt.Print("> ")
+		nArgs, err := fmt.Scanf("%d\n", &optionNumber)
+		if nArgs == 1 && err == nil && optionNumber <= len(playlists) && optionNumber >= 1 {
+			return playlists[optionNumber-1].playlist
+		}
+		fmt.Println("Invalid option! Try it again...")
+	}
+}
+
+
+//TODO: 
+// use slog package instead
+// handle all fatal errors to user friendly messages
 func main() {
 	defer func() {
+		//TODO: use graceful shutdown with os.Signal
 		if err := recover(); err != nil {
 			fmt.Printf("recovered error %v\n", err)
 		}
@@ -49,7 +85,7 @@ func main() {
 	}()
 
 	gamePageUrl := flag.String("game-page", "", `url for steam game page.`)
-	outputDir := flag.String("output-dir", getEnvString("OUTPUT_DIR", "./"), `output directory of result file. (default: ./`)
+	outputDir := flag.String("output-dir", getEnvString("OUTPUT_DIR", "./"), `output directory of result file. (default: ./)`)
 	flag.Parse()
 
 	if *gamePageUrl == "" {
@@ -61,11 +97,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	err = fm.ExtractMasterPlaylists()
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
+	defer cancel()
+
+	if err := fm.ExtractMasterPlaylists(ctx); err != nil {
 		log.Fatal(err)
 	}
-
+	
+	//TODO: make generic helper to map new files
 	getFileNames := func(m *m3u8.MediaPlaylist) []string {
 		fileNames := make([]string, 0)
 		fileNames = append(fileNames, m.Map.URI)
@@ -77,17 +116,18 @@ func main() {
 		return fileNames
 	}
 
-	err = fm.mergeAndWriteFile(fm.outputVideoFile, getFileNames(fm.videoPlaylists["640x360"])...)
-	if err != nil {
-		log.Fatal(err)
-	}
+	videoPl := chooseResolution(fm.videoPlaylists)
 
-	err = fm.mergeAndWriteFile(fm.outputAudioFile, getFileNames(fm.audioPlaylist)...)
-	if err != nil {
-		log.Fatal(err)
-	}
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return fm.mergeAndWriteFile(ctx, fm.outputVideoFile, getFileNames(videoPl)...)
+	})
+	g.Go(func() error {
+		return fm.mergeAndWriteFile(ctx, fm.outputAudioFile, getFileNames(fm.audioPlaylist)...)
+	})
+	g.Wait()
 
-	outputPath, err := getAbsoluteOutputPath(*outputDir)
+	outputPath, err := validateOutputPath(*outputDir)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -97,7 +137,7 @@ func main() {
 	}
 }
 
-func getAbsoluteOutputPath(outPath string) (string, error) {
+func validateOutputPath(outPath string) (string, error) {
 	outPath = path.Clean(outPath)
 	info, err := os.Stat(outPath)
 	if err != nil {
@@ -111,14 +151,20 @@ func getAbsoluteOutputPath(outPath string) (string, error) {
 	return path.Join(outPath, "output.mp4"), nil
 }
 
+type videoPlaylist struct {
+	resolution string
+	playlist   *m3u8.MediaPlaylist
+}
+
 type FileManager struct {
 	gamePageUrl      string
 	basePlaylistsUrl string
 	// resolution => Media Playlist Metadata
-	videoPlaylists  map[string]*m3u8.MediaPlaylist
+	videoPlaylists  []*videoPlaylist
 	audioPlaylist   *m3u8.MediaPlaylist
 	outputVideoFile *os.File
 	outputAudioFile *os.File
+	httpClient      *http.Client
 }
 
 func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*FileManager, error) {
@@ -132,66 +178,63 @@ func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*Fi
 		return nil, err
 	}
 
-	return &FileManager{gamePageUrl: gamePageUrl, outputVideoFile: vF, outputAudioFile: aF, videoPlaylists: map[string]*m3u8.MediaPlaylist{}}, nil
+	c := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10,
+			MaxConnsPerHost:     10,
+			IdleConnTimeout:     time.Second * 10,
+		},
+		Timeout: time.Second * 5,
+	}
+
+	return &FileManager{
+		gamePageUrl:     gamePageUrl,
+		outputVideoFile: vF,
+		outputAudioFile: aF,
+		httpClient:      c,
+	}, nil
 }
 
-func (fm *FileManager) mergeAndWriteFile(f *os.File, fileNames ...string) error {
+func (fm *FileManager) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, fileNames ...string) error {
 	defer f.Close()
 
-	writeToBin := func(part string) error {
-		resp, err := http.Get(fmt.Sprintf("%s/%s", fm.basePlaylistsUrl, part))
+	for _, name := range fileNames {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", fm.basePlaylistsUrl, name), nil)
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+
+		resp, err := fm.httpClient.Do(req)
+		if err != nil {
+			return err
+		}
 
 		n, err := io.Copy(f, resp.Body)
 		if err != nil {
 			return err
 		}
 
-		fmt.Printf("written %d bytes for %s into %s\n", n, part, f.Name())
-		return nil
-	}
-
-	for _, name := range fileNames {
-		if err := writeToBin(name); err != nil {
-			return err
-		}
+		resp.Body.Close()
+		fmt.Printf("written %d bytes for %s\n", n, name)
 	}
 	return nil
 }
 
-func (fm *FileManager) ExtractMasterPlaylists() error {
-	html, err := downloadGamePageDocument(fm.gamePageUrl)
+func (fm *FileManager) ExtractMasterPlaylists(ctx context.Context) error {
+
+	masterpl, err := fm.selectMasterPlaylist(ctx)
 	if err != nil {
 		return err
 	}
 
-	data, err := extractDataProps(html)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("data: %+v\n", data)
-	// extract base url and master playlist name
-	// https://host/path/to/app/hls_264_master.m3u8?t=1733940241
-	lastSlashIdx := strings.LastIndex(data[0].HLSManifest, "/")
-	questionMarkIndex := strings.Index(data[0].HLSManifest, "?")
-	fm.basePlaylistsUrl = data[0].HLSManifest[:lastSlashIdx]
-
-	//FIXME: for test, only use the first video of the page
-	playlist, err := fm.downloadAndDecodeM3U8File(data[0].HLSManifest[lastSlashIdx+1 : questionMarkIndex])
-	if err != nil {
-		return err
-	}
-
-	masterpl := playlist.(*m3u8.MasterPlaylist)
 	// setup video playlist variants by resolution
 	for _, variant := range masterpl.Variants {
-		fmt.Printf("Variant: %+v\n\n", variant.URI)
-		if pl, err := fm.downloadAndDecodeM3U8File(variant.URI); err == nil {
-			fm.videoPlaylists[variant.Resolution] = pl.(*m3u8.MediaPlaylist)
+		if pl, err := fm.downloadAndDecodeM3U8File(ctx, variant.URI); err == nil {
+			fm.videoPlaylists = append(fm.videoPlaylists, &videoPlaylist{
+				resolution: variant.Resolution,
+				playlist:   pl.(*m3u8.MediaPlaylist),
+			})
 		} else {
 			return err
 		}
@@ -199,9 +242,8 @@ func (fm *FileManager) ExtractMasterPlaylists() error {
 
 	for _, alt := range masterpl.GetAllAlternatives() {
 		if alt.Type == "AUDIO" {
-			if pl, err := fm.downloadAndDecodeM3U8File(alt.URI); err == nil {
+			if pl, err := fm.downloadAndDecodeM3U8File(ctx, alt.URI); err == nil {
 				fm.audioPlaylist = pl.(*m3u8.MediaPlaylist)
-				fmt.Printf("Audio: %+v\n\n", fm.audioPlaylist)
 				break
 			} else {
 				return err
@@ -212,10 +254,47 @@ func (fm *FileManager) ExtractMasterPlaylists() error {
 	return nil
 }
 
-// https://video.fastly.steamstatic.com/store_trailers/1063730/798628/39a388c693c9f2d892cfad5d95ab25dd759662b5/1750611698/hls_264_master.m3u8
-// https://video.fastly.steamstatic.com/store_trailers/1063730/798628/39a388c693c9f2d892cfad5d95ab25dd759662b5/1750611698/hls_264_3_video.m3u8
-func (fm *FileManager) downloadAndDecodeM3U8File(fileName string) (m3u8.Playlist, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/%s", fm.basePlaylistsUrl, fileName))
+func (fm *FileManager) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPlaylist, error) {
+	html, err := fm.downloadGamePageDocument(ctx, fm.gamePageUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := extractDataProps(html)
+	if err != nil {
+		return nil, err
+	}
+
+	selectedVideoProps := chooseVideoPlaylist(data)
+
+	// extract base url and master playlist name
+	// https://host/path/to/app/hls_264_master.m3u8?t=1733940241
+	lastSlashIdx := strings.LastIndex(selectedVideoProps.HLSManifest, "/")
+	questionMarkIndex := strings.Index(selectedVideoProps.HLSManifest, "?")
+
+	fm.basePlaylistsUrl = selectedVideoProps.HLSManifest[:lastSlashIdx]
+
+	//FIXME: for test, only use the first video of the page
+	playlist, err := fm.downloadAndDecodeM3U8File(ctx, selectedVideoProps.HLSManifest[lastSlashIdx+1:questionMarkIndex])
+	if err != nil {
+		return nil, err
+	}
+
+	return playlist.(*m3u8.MasterPlaylist), nil
+}
+
+func chooseVideoPlaylist(options []DataProps) DataProps {
+	//TODO: select option from user choice
+	return options[0]
+}
+
+func (fm *FileManager) downloadAndDecodeM3U8File(ctx context.Context, fileName string) (m3u8.Playlist, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", fm.basePlaylistsUrl, fileName), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := fm.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -228,14 +307,19 @@ func (fm *FileManager) downloadAndDecodeM3U8File(fileName string) (m3u8.Playlist
 	return paylist, nil
 }
 
-func downloadGamePageDocument(url string) (*html.Node, error) {
-	res, err := http.Get(url)
+func (fm *FileManager) downloadGamePageDocument(ctx context.Context, url string) (*html.Node, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	defer res.Body.Close()
-	node, err := html.Parse(res.Body)
+	resp, err := fm.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	node, err := html.Parse(resp.Body)
 	if err != nil {
 		return nil, err
 	}
