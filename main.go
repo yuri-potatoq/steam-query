@@ -44,7 +44,6 @@ func getEnvString(name string, dft ...string) string {
 }
 
 func chooseResolution(playlists []*videoPlaylist) *m3u8.MediaPlaylist {
-	var optionNumber int
 	fmt.Println("Select output resolution option:")
 
 	// sort playlist by resolution
@@ -58,18 +57,35 @@ func chooseResolution(playlists []*videoPlaylist) *m3u8.MediaPlaylist {
 		fmt.Printf(" [%d] %s\n", i+1, pl.resolution)
 	}
 
+	return playlists[getInputNumber(1, len(playlists))-1].playlist
+}
+
+func getInputNumber(start, end int) int {
+	var optionNumber int
+
 	for {
 		fmt.Print("> ")
 		nArgs, err := fmt.Scanf("%d\n", &optionNumber)
-		if nArgs == 1 && err == nil && optionNumber <= len(playlists) && optionNumber >= 1 {
-			return playlists[optionNumber-1].playlist
+		if err == nil && nArgs == 1 && optionNumber <= end && optionNumber >= start {
+			return optionNumber
 		}
 		fmt.Println("Invalid option! Try it again...")
 	}
 }
 
+// func ttySize() int {
+//  _, _, errno := syscall.Syscall(
+//         syscall.SYS_IOCTL,
+//         uintptr(f.Fd()),
+//         uintptr(_I2C_RDWR),
+//         uintptr(unsafe.Pointer(&data)),
+//     )
+//     if (errno != 0) {
+//         err = errno
+//     }
+// }
 
-//TODO: 
+// TODO:
 // use slog package instead
 // handle all fatal errors to user friendly messages
 func main() {
@@ -103,7 +119,7 @@ func main() {
 	if err := fm.ExtractMasterPlaylists(ctx); err != nil {
 		log.Fatal(err)
 	}
-	
+
 	//TODO: make generic helper to map new files
 	getFileNames := func(m *m3u8.MediaPlaylist) []string {
 		fileNames := make([]string, 0)
@@ -222,7 +238,6 @@ func (fm *FileManager) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, 
 }
 
 func (fm *FileManager) ExtractMasterPlaylists(ctx context.Context) error {
-
 	masterpl, err := fm.selectMasterPlaylist(ctx)
 	if err != nil {
 		return err
@@ -274,7 +289,6 @@ func (fm *FileManager) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPl
 
 	fm.basePlaylistsUrl = selectedVideoProps.HLSManifest[:lastSlashIdx]
 
-	//FIXME: for test, only use the first video of the page
 	playlist, err := fm.downloadAndDecodeM3U8File(ctx, selectedVideoProps.HLSManifest[lastSlashIdx+1:questionMarkIndex])
 	if err != nil {
 		return nil, err
@@ -284,8 +298,11 @@ func (fm *FileManager) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPl
 }
 
 func chooseVideoPlaylist(options []DataProps) DataProps {
-	//TODO: select option from user choice
-	return options[0]
+	fmt.Println("Select which video from the page you with download:")
+	for i, _ := range options {
+		fmt.Printf("[%d] %dº video\n", i+1, i+1)
+	}
+	return options[getInputNumber(1, len(options))-1]
 }
 
 func (fm *FileManager) downloadAndDecodeM3U8File(ctx context.Context, fileName string) (m3u8.Playlist, error) {
@@ -327,15 +344,17 @@ func (fm *FileManager) downloadGamePageDocument(ctx context.Context, url string)
 	return node, nil
 }
 
+// The extraction use depth-first preorder traversal, so the elements are stored
+// in the some order as they are on HTML.
 func extractDataProps(n *html.Node) ([]DataProps, error) {
 	var props []DataProps
 
 	for d := range n.Descendants() {
 		if d.DataAtom == atom.Div && len(d.Attr) > 1 {
-			_, is_player_div := ExtractAttribute(d.Attr, func(t html.Attribute) bool {
+			_, is_player_div := extractAttribute(d.Attr, func(t html.Attribute) bool {
 				return t.Key == "class" && t.Val == "highlight_player_item highlight_movie"
 			})
-			props_attrs, has_props := ExtractAttribute(d.Attr, func(t html.Attribute) bool {
+			props_attrs, has_props := extractAttribute(d.Attr, func(t html.Attribute) bool {
 				return t.Key == "data-props"
 			})
 
@@ -354,7 +373,7 @@ func extractDataProps(n *html.Node) ([]DataProps, error) {
 	return props, nil
 }
 
-func ExtractAttribute(xs []html.Attribute, f func(html.Attribute) bool) (html.Attribute, bool) {
+func extractAttribute(xs []html.Attribute, f func(html.Attribute) bool) (html.Attribute, bool) {
 	for _, it := range xs {
 		if f(it) {
 			return it, true
