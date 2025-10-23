@@ -16,12 +16,10 @@ import (
 	"errors"
 )
 
-const TIOCGWINSZ = 0x5413
-
 func GetTermSize() (int, error) {
 	row := C.int(0)
 	if n := C.get_win_col(&row); n == -1 {
-		return 0, errors.New("can't get windows row ")
+		return 0, errors.New("can't get window column size")
 	}
 	return int(row), nil
 }

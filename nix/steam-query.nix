@@ -1,9 +1,10 @@
 {
   pkgs ? import <nixpkgs> { },
   srcFiles ? ./.,
+  version,
 }: with pkgs; buildGoModule {
   pname = "steam-query";
-  version = "0.1.0";
+  version = version;
 
   src = lib.cleanSourceWith {
     src = srcFiles;
@@ -12,7 +13,7 @@
       in !(baseName == "result");
   };
 
-  vendorHash = "sha256-Z78u1XjvL+Zoao2j8MbA1BjuOZjfSluCiFzI8f0OSiI=";
+  vendorHash = "sha256-s26BHPcVqHhUmtU2sZWLWzXlglj0yICGz1OXCDXrvNI=";
 
   nativeBuildInputs = [
     pkg-config

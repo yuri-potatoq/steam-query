@@ -32,17 +32,6 @@ var (
 	tmpVideoFile = "video.m4s"
 )
 
-func getEnvString(name string, dft ...string) string {
-	value, ok := os.LookupEnv(name)
-	if !ok {
-		if len(dft) >= 1 {
-			return dft[0]
-		}
-		log.Fatalf("can't find environment variable for [%s]", name)
-	}
-	return value
-}
-
 func chooseResolution(playlists []*videoPlaylist) *m3u8.MediaPlaylist {
 	fmt.Println("Select output resolution option:")
 
@@ -59,31 +48,6 @@ func chooseResolution(playlists []*videoPlaylist) *m3u8.MediaPlaylist {
 
 	return playlists[getInputNumber(1, len(playlists))-1].playlist
 }
-
-func getInputNumber(start, end int) int {
-	var optionNumber int
-
-	for {
-		fmt.Print("> ")
-		nArgs, err := fmt.Scanf("%d\n", &optionNumber)
-		if err == nil && nArgs == 1 && optionNumber <= end && optionNumber >= start {
-			return optionNumber
-		}
-		fmt.Println("Invalid option! Try it again...")
-	}
-}
-
-// func ttySize() int {
-//  _, _, errno := syscall.Syscall(
-//         syscall.SYS_IOCTL,
-//         uintptr(f.Fd()),
-//         uintptr(_I2C_RDWR),
-//         uintptr(unsafe.Pointer(&data)),
-//     )
-//     if (errno != 0) {
-//         err = errno
-//     }
-// }
 
 // TODO:
 // use slog package instead
@@ -153,6 +117,10 @@ func main() {
 	}
 }
 
+/**
+ * Helper functions
+ */
+
 func validateOutputPath(outPath string) (string, error) {
 	outPath = path.Clean(outPath)
 	info, err := os.Stat(outPath)
@@ -167,12 +135,48 @@ func validateOutputPath(outPath string) (string, error) {
 	return path.Join(outPath, "output.mp4"), nil
 }
 
+func getEnvString(name string, dft ...string) string {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		if len(dft) >= 1 {
+			return dft[0]
+		}
+		log.Fatalf("can't find environment variable for [%s]", name)
+	}
+	return value
+}
+
+func getInputNumber(start, end int) int {
+	var optionNumber int
+
+	for {
+		fmt.Print("> ")
+		nArgs, err := fmt.Scanf("%d\n", &optionNumber)
+		if err == nil && nArgs == 1 && optionNumber <= end && optionNumber >= start {
+			return optionNumber
+		}
+		fmt.Println("Invalid option! Try it again...")
+	}
+}
+
+func chooseVideoPlaylist(options []DataProps) DataProps {
+	fmt.Println("Select which video from the page you with download:")
+	for i, _ := range options {
+		fmt.Printf("[%d] %dº video\n", i+1, i+1)
+	}
+	return options[getInputNumber(1, len(options))-1]
+}
+
+/**
+ * Application engine.
+ */
+
 type videoPlaylist struct {
 	resolution string
 	playlist   *m3u8.MediaPlaylist
 }
 
-type FileManager struct {
+type Engine struct {
 	gamePageUrl      string
 	basePlaylistsUrl string
 	// resolution => Media Playlist Metadata
@@ -183,7 +187,7 @@ type FileManager struct {
 	httpClient      *http.Client
 }
 
-func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*FileManager, error) {
+func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*Engine, error) {
 	vF, err := os.OpenFile(videoOutputFile, os.O_CREATE|os.O_RDWR, os.ModePerm)
 	if err != nil {
 		return nil, err
@@ -194,17 +198,53 @@ func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*Fi
 		return nil, err
 	}
 
+	// // Try multiple cert locations
+	// certPaths := []string{
+	// 	"/etc/ssl/certs/ca-certificates.crt",       // Debian/Ubuntu/Gentoo
+	// 	"/etc/pki/tls/certs/ca-bundle.crt",         // Fedora/RHEL
+	// 	"/etc/ssl/ca-bundle.pem",                   // OpenSUSE
+	// 	"/etc/ssl/cert.pem",                        // Alpine
+	// 	"/usr/local/share/certs/ca-root-nss.crt",   // FreeBSD
+	// 	"/etc/ssl/certs/steam-query-ca-bundle.crt", // Our bundled cert
+	// }
+
+	// // Use system cert pool
+	// rootCAs, _ := x509.SystemCertPool()
+	// if rootCAs == nil {
+	// 	rootCAs = x509.NewCertPool()
+	// }
+
+	// // Try loading from known paths
+	// for _, certPath := range certPaths {
+	// 	if certs, err := os.ReadFile(certPath); err == nil {
+	// 		rootCAs.AppendCertsFromPEM(certs)
+	// 		break
+	// 	}
+	// }
+
+	// // Check SSL_CERT_FILE env var
+	// if certFile := os.Getenv("SSL_CERT_FILE"); certFile != "" {
+	// 	if certs, err := os.ReadFile(certFile); err == nil {
+	// 		rootCAs.AppendCertsFromPEM(certs)
+	// 	}
+	// }
+
+	// tlsConfig := &tls.Config{
+	// 	RootCAs: rootCAs,
+	// }
+
 	c := &http.Client{
 		Transport: &http.Transport{
 			MaxIdleConns:        10,
 			MaxIdleConnsPerHost: 10,
 			MaxConnsPerHost:     10,
 			IdleConnTimeout:     time.Second * 10,
+			// TLSClientConfig:     tlsConfig,
 		},
 		Timeout: time.Second * 5,
 	}
 
-	return &FileManager{
+	return &Engine{
 		gamePageUrl:     gamePageUrl,
 		outputVideoFile: vF,
 		outputAudioFile: aF,
@@ -212,16 +252,16 @@ func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*Fi
 	}, nil
 }
 
-func (fm *FileManager) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, fileNames ...string) error {
+func (e *Engine) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, fileNames ...string) error {
 	defer f.Close()
 
 	for _, name := range fileNames {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", fm.basePlaylistsUrl, name), nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", e.basePlaylistsUrl, name), nil)
 		if err != nil {
 			return err
 		}
 
-		resp, err := fm.httpClient.Do(req)
+		resp, err := e.httpClient.Do(req)
 		if err != nil {
 			return err
 		}
@@ -237,16 +277,16 @@ func (fm *FileManager) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, 
 	return nil
 }
 
-func (fm *FileManager) ExtractMasterPlaylists(ctx context.Context) error {
-	masterpl, err := fm.selectMasterPlaylist(ctx)
+func (e *Engine) ExtractMasterPlaylists(ctx context.Context) error {
+	masterpl, err := e.selectMasterPlaylist(ctx)
 	if err != nil {
 		return err
 	}
 
 	// setup video playlist variants by resolution
 	for _, variant := range masterpl.Variants {
-		if pl, err := fm.downloadAndDecodeM3U8File(ctx, variant.URI); err == nil {
-			fm.videoPlaylists = append(fm.videoPlaylists, &videoPlaylist{
+		if pl, err := e.downloadAndDecodeM3U8File(ctx, variant.URI); err == nil {
+			e.videoPlaylists = append(e.videoPlaylists, &videoPlaylist{
 				resolution: variant.Resolution,
 				playlist:   pl.(*m3u8.MediaPlaylist),
 			})
@@ -257,8 +297,8 @@ func (fm *FileManager) ExtractMasterPlaylists(ctx context.Context) error {
 
 	for _, alt := range masterpl.GetAllAlternatives() {
 		if alt.Type == "AUDIO" {
-			if pl, err := fm.downloadAndDecodeM3U8File(ctx, alt.URI); err == nil {
-				fm.audioPlaylist = pl.(*m3u8.MediaPlaylist)
+			if pl, err := e.downloadAndDecodeM3U8File(ctx, alt.URI); err == nil {
+				e.audioPlaylist = pl.(*m3u8.MediaPlaylist)
 				break
 			} else {
 				return err
@@ -269,8 +309,8 @@ func (fm *FileManager) ExtractMasterPlaylists(ctx context.Context) error {
 	return nil
 }
 
-func (fm *FileManager) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPlaylist, error) {
-	html, err := fm.downloadGamePageDocument(ctx, fm.gamePageUrl)
+func (e *Engine) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPlaylist, error) {
+	html, err := e.downloadGamePageDocument(ctx, e.gamePageUrl)
 	if err != nil {
 		return nil, err
 	}
@@ -287,9 +327,9 @@ func (fm *FileManager) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPl
 	lastSlashIdx := strings.LastIndex(selectedVideoProps.HLSManifest, "/")
 	questionMarkIndex := strings.Index(selectedVideoProps.HLSManifest, "?")
 
-	fm.basePlaylistsUrl = selectedVideoProps.HLSManifest[:lastSlashIdx]
+	e.basePlaylistsUrl = selectedVideoProps.HLSManifest[:lastSlashIdx]
 
-	playlist, err := fm.downloadAndDecodeM3U8File(ctx, selectedVideoProps.HLSManifest[lastSlashIdx+1:questionMarkIndex])
+	playlist, err := e.downloadAndDecodeM3U8File(ctx, selectedVideoProps.HLSManifest[lastSlashIdx+1:questionMarkIndex])
 	if err != nil {
 		return nil, err
 	}
@@ -297,21 +337,13 @@ func (fm *FileManager) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPl
 	return playlist.(*m3u8.MasterPlaylist), nil
 }
 
-func chooseVideoPlaylist(options []DataProps) DataProps {
-	fmt.Println("Select which video from the page you with download:")
-	for i, _ := range options {
-		fmt.Printf("[%d] %dº video\n", i+1, i+1)
-	}
-	return options[getInputNumber(1, len(options))-1]
-}
-
-func (fm *FileManager) downloadAndDecodeM3U8File(ctx context.Context, fileName string) (m3u8.Playlist, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", fm.basePlaylistsUrl, fileName), nil)
+func (e *Engine) downloadAndDecodeM3U8File(ctx context.Context, fileName string) (m3u8.Playlist, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", e.basePlaylistsUrl, fileName), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := fm.httpClient.Do(req)
+	resp, err := e.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -324,13 +356,13 @@ func (fm *FileManager) downloadAndDecodeM3U8File(ctx context.Context, fileName s
 	return paylist, nil
 }
 
-func (fm *FileManager) downloadGamePageDocument(ctx context.Context, url string) (*html.Node, error) {
+func (e *Engine) downloadGamePageDocument(ctx context.Context, url string) (*html.Node, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := fm.httpClient.Do(req)
+	resp, err := e.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
