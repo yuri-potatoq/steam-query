@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,6 +28,11 @@ import (
 )
 
 type DataProps struct {
+	AppName  string        `json:"appName"`
+	Trailers []TrailerData `json:"trailers"`
+}
+
+type TrailerData struct {
 	HLSManifest string `json:"hlsManifest"`
 }
 
@@ -60,81 +66,6 @@ var (
 	gamePageUrl string
 	outputDir   string
 )
-
-func main2() {
-	w, err := SetupWindowTable()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
-
-	w.RefreshRoutine(ctx)
-
-	defer func() {
-		cancel()
-		if err := recover(); err != nil {
-			w.Close()
-			log.Fatal(err)
-		}
-		w.Close()
-	}()
-
-	g, _ := errgroup.WithContext(context.Background())
-
-	g.Go(func() error {
-		line := NewProgressLine()
-		_, err = w.addLine(line.Blocks()...)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		defer func() {
-			if err := recover(); err != nil {
-				w.Close()
-				log.Printf("Recovered from panic: %v\nStack Trace:\n%s", err, debug.Stack())
-				log.Fatal()
-			}
-		}()
-
-		for {
-			line.UpdateInfo(fmt.Sprintf("Time now is line 2 ........................ %+v", time.Now().Nanosecond()))
-			finished := line.Progress(10)
-			if finished {
-				break
-			}
-			time.Sleep(time.Millisecond * 100)
-		}
-		return nil
-	})
-
-	g.Go(func() error {
-		line := NewProgressLine()
-		_, err = w.addLine(line.Blocks()...)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		defer func() {
-			if err := recover(); err != nil {
-				w.Close()
-				log.Printf("Recovered from panic: %v\nStack Trace:\n%s", err, debug.Stack())
-				log.Fatal()
-			}
-		}()
-
-		for {
-			line.UpdateInfo(fmt.Sprintf("Time now is line 1 ........................ %+v", time.Now().Nanosecond()))
-			finished := line.Progress(1)
-			if finished {
-				break
-			}
-			time.Sleep(time.Millisecond * 50)
-		}
-		return nil
-	})
-	g.Wait()
-}
 
 func getCursorPos() (row int, col int, err error) {
 	fmt.Printf("\033[6n\r")
@@ -209,13 +140,14 @@ func runApp(ctx context.Context) error {
 		return err
 	}
 
-	// w, err := SetupWindowTable()
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// fm.win = w
+	w, err := SetupWindowTable()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer w.Close()
 
-	// w.RefreshRoutine(ctx)
+	fm.win = w
+	w.RefreshRoutine(ctx)
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
@@ -285,17 +217,17 @@ func getInputNumber(ctx context.Context, start, end int) (int, error) {
 	}
 }
 
-func chooseVideoPlaylist(ctx context.Context, options []DataProps) (DataProps, error) {
+func chooseVideoPlaylist(ctx context.Context, options DataProps) (TrailerData, error) {
 	fmt.Println("Select which video from the page you with download:")
-	for i, _ := range options {
+	for i, _ := range options.Trailers {
 		fmt.Printf("[%d] %dº video\n", i+1, i+1)
 	}
 
-	selectedIdx, err := getInputNumber(ctx, 1, len(options))
+	selectedIdx, err := getInputNumber(ctx, 1, len(options.Trailers))
 	if err != nil {
-		return DataProps{}, err
+		return TrailerData{}, err
 	}
-	return options[selectedIdx-1], nil
+	return options.Trailers[selectedIdx-1], nil
 }
 
 /**
@@ -337,7 +269,7 @@ func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*En
 			MaxConnsPerHost:     10,
 			IdleConnTimeout:     time.Second * 10,
 		},
-		Timeout: time.Second * 5,
+		Timeout: time.Minute * 1,
 	}
 
 	return &Engine{
@@ -351,18 +283,20 @@ func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*En
 func (e *Engine) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, fileNames ...string) error {
 	defer f.Close()
 
-	// progress := NewProgressLine()
-	// _, err := e.win.addLine(progress.Blocks()...)
-	// if err != nil {
-	// 	return err
-	// }
-	// stepPercentage := (1 / len(fileNames)) * 100
+	progress := NewProgressLine()
+	_, err := e.win.addLine(progress.Blocks()...)
+	if err != nil {
+		return err
+	}
+
+	// rounding to above them we will always have bar completed
+	// TODO: think another way to have the progress bar and total of items synced
+	stepPercentage := int(math.Ceil((1.0 / float64(len(fileNames))) * 100.0))
 
 	for _, name := range fileNames {
-		url := fmt.Sprintf("%s/%s", e.basePlaylistsUrl, name)
-		// progress.UpdateInfo(fmt.Sprintf("Downloading %s", url))
+		progress.UpdateInfo(fmt.Sprintf("Downloading %s", name))
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", e.basePlaylistsUrl, name), nil)
 		if err != nil {
 			return err
 		}
@@ -372,14 +306,14 @@ func (e *Engine) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, fileNa
 			return err
 		}
 
-		n, err := io.Copy(f, resp.Body)
+		_, err = io.Copy(f, resp.Body)
 		if err != nil {
+			resp.Body.Close()
 			return err
 		}
-
 		resp.Body.Close()
-		fmt.Printf("written %d bytes for %s\n", n, name)
-		// progress.Progress(stepPercentage)
+
+		progress.Progress(stepPercentage)
 	}
 	return nil
 }
@@ -427,20 +361,19 @@ func (e *Engine) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPlaylist
 		return nil, err
 	}
 
-	fmt.Printf("data: %+v\n", data)
-	selectedVideoProps, err := chooseVideoPlaylist(ctx, data)
+	selectedTrailer, err := chooseVideoPlaylist(ctx, data)
 	if err != nil {
 		return nil, err
 	}
 
 	// extract base url and master playlist name
 	// https://host/path/to/app/hls_264_master.m3u8?t=1733940241
-	lastSlashIdx := strings.LastIndex(selectedVideoProps.HLSManifest, "/")
-	questionMarkIndex := strings.Index(selectedVideoProps.HLSManifest, "?")
+	lastSlashIdx := strings.LastIndex(selectedTrailer.HLSManifest, "/")
+	questionMarkIndex := strings.Index(selectedTrailer.HLSManifest, "?")
 
-	e.basePlaylistsUrl = selectedVideoProps.HLSManifest[:lastSlashIdx]
+	e.basePlaylistsUrl = selectedTrailer.HLSManifest[:lastSlashIdx]
 
-	playlist, err := e.downloadAndDecodeM3U8File(ctx, selectedVideoProps.HLSManifest[lastSlashIdx+1:questionMarkIndex])
+	playlist, err := e.downloadAndDecodeM3U8File(ctx, selectedTrailer.HLSManifest[lastSlashIdx+1:questionMarkIndex])
 	if err != nil {
 		return nil, err
 	}
@@ -488,33 +421,32 @@ func (e *Engine) downloadGamePageDocument(ctx context.Context, url string) (*htm
 }
 
 // The extraction use depth-first preorder traversal, so the elements are stored
-// in the some order as they are on HTML.
-func extractDataProps(n *html.Node) ([]DataProps, error) {
-	var props []DataProps
+// in the same order as they were on HTML.
+func extractDataProps(n *html.Node) (DataProps, error) {
+	props := DataProps{Trailers: make([]TrailerData, 0)}
 
 	for d := range n.Descendants() {
 		if d.DataAtom == atom.Div && len(d.Attr) > 1 {
+			// TODO: investigate why that changed...For now just get the first elment with data-props
 			// _, is_player_div := extractAttribute(d.Attr, func(t html.Attribute) bool {
 			// 	return t.Key == "class" && t.Val == "highlight_player_item highlight_movie"
 			// })
+
 			props_attrs, has_props := extractAttribute(d.Attr, func(t html.Attribute) bool {
 				return t.Key == "data-props"
 			})
 
 			if has_props {
-				var p DataProps
-				err := json.Unmarshal([]byte(props_attrs.Val), &p)
+				err := json.Unmarshal([]byte(props_attrs.Val), &props)
 				if err != nil {
-					return nil, err
+					return DataProps{}, err
 				}
-
-				props = append(props, p)
 			}
 		}
 	}
 
-	if len(props) == 0 {
-		return nil, errors.New("can't find any 'data-props'")
+	if len(props.Trailers) == 0 {
+		return DataProps{}, errors.New("can't find any game page trailers")
 	}
 
 	return props, nil
