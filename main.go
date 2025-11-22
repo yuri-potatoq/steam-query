@@ -11,10 +11,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Eyevinn/hls-m3u8/m3u8"
@@ -32,7 +35,7 @@ var (
 	tmpVideoFile = "video.m4s"
 )
 
-func chooseResolution(playlists []*videoPlaylist) *m3u8.MediaPlaylist {
+func chooseResolution(ctx context.Context, playlists []*videoPlaylist) (*m3u8.MediaPlaylist, error) {
 	fmt.Println("Select output resolution option:")
 
 	// sort playlist by resolution
@@ -46,42 +49,147 @@ func chooseResolution(playlists []*videoPlaylist) *m3u8.MediaPlaylist {
 		fmt.Printf(" [%d] %s\n", i+1, pl.resolution)
 	}
 
-	return playlists[getInputNumber(1, len(playlists))-1].playlist
+	selectedIdx, err := getInputNumber(ctx, 1, len(playlists))
+	if err != nil {
+		return nil, err
+	}
+	return playlists[selectedIdx-1].playlist, nil
 }
 
-// TODO:
-// use slog package instead
-// handle all fatal errors to user friendly messages
-func main() {
-	defer func() {
-		//TODO: use graceful shutdown with os.Signal
-		if err := recover(); err != nil {
-			fmt.Printf("recovered error %v\n", err)
-		}
+var (
+	gamePageUrl string
+	outputDir   string
+)
 
-		fmt.Println("removing temporary files...")
-		os.Remove(tmpAudioFile)
-		os.Remove(tmpVideoFile)
-	}()
-
-	gamePageUrl := flag.String("game-page", "", `url for steam game page.`)
-	outputDir := flag.String("output-dir", getEnvString("OUTPUT_DIR", "./"), `output directory of result file. (default: ./)`)
-	flag.Parse()
-
-	if *gamePageUrl == "" {
-		*gamePageUrl = getEnvString("GAME_PAGE")
-	}
-
-	fm, err := SetupFileManager(*gamePageUrl, tmpVideoFile, tmpAudioFile)
+func main2() {
+	w, err := SetupWindowTable()
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
-	defer cancel()
+
+	w.RefreshRoutine(ctx)
+
+	defer func() {
+		cancel()
+		if err := recover(); err != nil {
+			w.Close()
+			log.Fatal(err)
+		}
+		w.Close()
+	}()
+
+	g, _ := errgroup.WithContext(context.Background())
+
+	g.Go(func() error {
+		line := NewProgressLine()
+		_, err = w.addLine(line.Blocks()...)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		defer func() {
+			if err := recover(); err != nil {
+				w.Close()
+				log.Printf("Recovered from panic: %v\nStack Trace:\n%s", err, debug.Stack())
+				log.Fatal()
+			}
+		}()
+
+		for {
+			line.UpdateInfo(fmt.Sprintf("Time now is line 2 ........................ %+v", time.Now().Nanosecond()))
+			finished := line.Progress(10)
+			if finished {
+				break
+			}
+			time.Sleep(time.Millisecond * 100)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		line := NewProgressLine()
+		_, err = w.addLine(line.Blocks()...)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		defer func() {
+			if err := recover(); err != nil {
+				w.Close()
+				log.Printf("Recovered from panic: %v\nStack Trace:\n%s", err, debug.Stack())
+				log.Fatal()
+			}
+		}()
+
+		for {
+			line.UpdateInfo(fmt.Sprintf("Time now is line 1 ........................ %+v", time.Now().Nanosecond()))
+			finished := line.Progress(1)
+			if finished {
+				break
+			}
+			time.Sleep(time.Millisecond * 50)
+		}
+		return nil
+	})
+	g.Wait()
+}
+
+func getCursorPos() (row int, col int, err error) {
+	fmt.Printf("\033[6n\r")
+	// Expected format: ESC [ {row} ; {col} R
+	_, err = fmt.Scanf("\033[%d;%dR", &row, &col)
+	if err != nil {
+		return 0, 0, err
+	}
+	return row, col, nil
+}
+
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		os.Interrupt,
+		syscall.SIGINT,
+		syscall.SIGABRT,
+		syscall.SIGKILL,
+		syscall.SIGTERM)
+
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("Recovered from panic: %v\nStack Trace:\n%s", err, debug.Stack())
+		}
+
+		fmt.Println("removing temporary files...")
+		os.Remove(tmpAudioFile)
+		os.Remove(tmpVideoFile)
+		cancel()
+	}()
+
+	flag.StringVar(&gamePageUrl, "game-page", "", `url for steam game page.`)
+	flag.StringVar(&outputDir, "output-dir", getEnvString("OUTPUT_DIR", "./"), `output directory of result file. (default: ./)`)
+	flag.Parse()
+
+	if gamePageUrl == "" {
+		gamePageUrl = getEnvString("GAME_PAGE")
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return runApp(ctx)
+	})
+	if err := g.Wait(); err != nil {
+		fmt.Printf("Unexpected error: %+v\n", err)
+	}
+}
+
+func runApp(ctx context.Context) error {
+	fm, err := SetupFileManager(gamePageUrl, tmpVideoFile, tmpAudioFile)
+	if err != nil {
+		return fmt.Errorf("setup file manager: %w", err)
+	}
 
 	if err := fm.ExtractMasterPlaylists(ctx); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("extract master playlists: %w", err)
 	}
 
 	//TODO: make generic helper to map new files
@@ -96,7 +204,18 @@ func main() {
 		return fileNames
 	}
 
-	videoPl := chooseResolution(fm.videoPlaylists)
+	videoPl, err := chooseResolution(ctx, fm.videoPlaylists)
+	if err != nil {
+		return err
+	}
+
+	// w, err := SetupWindowTable()
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// fm.win = w
+
+	// w.RefreshRoutine(ctx)
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
@@ -105,16 +224,19 @@ func main() {
 	g.Go(func() error {
 		return fm.mergeAndWriteFile(ctx, fm.outputAudioFile, getFileNames(fm.audioPlaylist)...)
 	})
-	g.Wait()
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("writing temp files: %w", err)
+	}
 
-	outputPath, err := validateOutputPath(*outputDir)
+	outputPath, err := validateOutputPath(outputDir)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("output path validation: %w", err)
 	}
 
 	if err := TransformMedia(tmpVideoFile, tmpAudioFile, outputPath); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("transforming to output format: %w", err)
 	}
+	return nil
 }
 
 /**
@@ -146,25 +268,34 @@ func getEnvString(name string, dft ...string) string {
 	return value
 }
 
-func getInputNumber(start, end int) int {
+func getInputNumber(ctx context.Context, start, end int) (int, error) {
 	var optionNumber int
-
 	for {
-		fmt.Print("> ")
-		nArgs, err := fmt.Scanf("%d\n", &optionNumber)
-		if err == nil && nArgs == 1 && optionNumber <= end && optionNumber >= start {
-			return optionNumber
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
+			fmt.Print("> ")
+			nArgs, err := fmt.Scanf("%d\n", &optionNumber)
+			if err == nil && nArgs == 1 && optionNumber <= end && optionNumber >= start {
+				return optionNumber, nil
+			}
+			fmt.Println("Invalid option! Try it again...")
 		}
-		fmt.Println("Invalid option! Try it again...")
 	}
 }
 
-func chooseVideoPlaylist(options []DataProps) DataProps {
+func chooseVideoPlaylist(ctx context.Context, options []DataProps) (DataProps, error) {
 	fmt.Println("Select which video from the page you with download:")
 	for i, _ := range options {
 		fmt.Printf("[%d] %dº video\n", i+1, i+1)
 	}
-	return options[getInputNumber(1, len(options))-1]
+
+	selectedIdx, err := getInputNumber(ctx, 1, len(options))
+	if err != nil {
+		return DataProps{}, err
+	}
+	return options[selectedIdx-1], nil
 }
 
 /**
@@ -185,6 +316,7 @@ type Engine struct {
 	outputVideoFile *os.File
 	outputAudioFile *os.File
 	httpClient      *http.Client
+	win             *windowTable
 }
 
 func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*Engine, error) {
@@ -198,48 +330,12 @@ func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*En
 		return nil, err
 	}
 
-	// // Try multiple cert locations
-	// certPaths := []string{
-	// 	"/etc/ssl/certs/ca-certificates.crt",       // Debian/Ubuntu/Gentoo
-	// 	"/etc/pki/tls/certs/ca-bundle.crt",         // Fedora/RHEL
-	// 	"/etc/ssl/ca-bundle.pem",                   // OpenSUSE
-	// 	"/etc/ssl/cert.pem",                        // Alpine
-	// 	"/usr/local/share/certs/ca-root-nss.crt",   // FreeBSD
-	// 	"/etc/ssl/certs/steam-query-ca-bundle.crt", // Our bundled cert
-	// }
-
-	// // Use system cert pool
-	// rootCAs, _ := x509.SystemCertPool()
-	// if rootCAs == nil {
-	// 	rootCAs = x509.NewCertPool()
-	// }
-
-	// // Try loading from known paths
-	// for _, certPath := range certPaths {
-	// 	if certs, err := os.ReadFile(certPath); err == nil {
-	// 		rootCAs.AppendCertsFromPEM(certs)
-	// 		break
-	// 	}
-	// }
-
-	// // Check SSL_CERT_FILE env var
-	// if certFile := os.Getenv("SSL_CERT_FILE"); certFile != "" {
-	// 	if certs, err := os.ReadFile(certFile); err == nil {
-	// 		rootCAs.AppendCertsFromPEM(certs)
-	// 	}
-	// }
-
-	// tlsConfig := &tls.Config{
-	// 	RootCAs: rootCAs,
-	// }
-
 	c := &http.Client{
 		Transport: &http.Transport{
 			MaxIdleConns:        10,
 			MaxIdleConnsPerHost: 10,
 			MaxConnsPerHost:     10,
 			IdleConnTimeout:     time.Second * 10,
-			// TLSClientConfig:     tlsConfig,
 		},
 		Timeout: time.Second * 5,
 	}
@@ -255,8 +351,18 @@ func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*En
 func (e *Engine) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, fileNames ...string) error {
 	defer f.Close()
 
+	// progress := NewProgressLine()
+	// _, err := e.win.addLine(progress.Blocks()...)
+	// if err != nil {
+	// 	return err
+	// }
+	// stepPercentage := (1 / len(fileNames)) * 100
+
 	for _, name := range fileNames {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/%s", e.basePlaylistsUrl, name), nil)
+		url := fmt.Sprintf("%s/%s", e.basePlaylistsUrl, name)
+		// progress.UpdateInfo(fmt.Sprintf("Downloading %s", url))
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return err
 		}
@@ -273,6 +379,7 @@ func (e *Engine) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, fileNa
 
 		resp.Body.Close()
 		fmt.Printf("written %d bytes for %s\n", n, name)
+		// progress.Progress(stepPercentage)
 	}
 	return nil
 }
@@ -320,7 +427,11 @@ func (e *Engine) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPlaylist
 		return nil, err
 	}
 
-	selectedVideoProps := chooseVideoPlaylist(data)
+	fmt.Printf("data: %+v\n", data)
+	selectedVideoProps, err := chooseVideoPlaylist(ctx, data)
+	if err != nil {
+		return nil, err
+	}
 
 	// extract base url and master playlist name
 	// https://host/path/to/app/hls_264_master.m3u8?t=1733940241
@@ -383,14 +494,14 @@ func extractDataProps(n *html.Node) ([]DataProps, error) {
 
 	for d := range n.Descendants() {
 		if d.DataAtom == atom.Div && len(d.Attr) > 1 {
-			_, is_player_div := extractAttribute(d.Attr, func(t html.Attribute) bool {
-				return t.Key == "class" && t.Val == "highlight_player_item highlight_movie"
-			})
+			// _, is_player_div := extractAttribute(d.Attr, func(t html.Attribute) bool {
+			// 	return t.Key == "class" && t.Val == "highlight_player_item highlight_movie"
+			// })
 			props_attrs, has_props := extractAttribute(d.Attr, func(t html.Attribute) bool {
 				return t.Key == "data-props"
 			})
 
-			if is_player_div && has_props {
+			if has_props {
 				var p DataProps
 				err := json.Unmarshal([]byte(props_attrs.Val), &p)
 				if err != nil {
@@ -400,6 +511,10 @@ func extractDataProps(n *html.Node) ([]DataProps, error) {
 				props = append(props, p)
 			}
 		}
+	}
+
+	if len(props) == 0 {
+		return nil, errors.New("can't find any 'data-props'")
 	}
 
 	return props, nil
