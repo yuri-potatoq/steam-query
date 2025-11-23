@@ -18,6 +18,7 @@ docker run -it -v ./output:/app/output steam-query -game-page <game-url>
 
 ### TODO:
 - [ ] Build packages to distribute for most commum platforms
+- [ ] Add more options to control aspects of converted video (bitrate, FPS, ...)
 
 ### Refs:
 - https://ffmpeg.org/doxygen/trunk/index.html

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"regexp"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -22,23 +23,29 @@ import (
 	"time"
 
 	"github.com/Eyevinn/hls-m3u8/m3u8"
-	"golang.org/x/net/html"
-	"golang.org/x/net/html/atom"
 	"golang.org/x/sync/errgroup"
 )
 
-type DataProps struct {
-	AppName  string        `json:"appName"`
-	Trailers []TrailerData `json:"trailers"`
+type SteamAppDetailsData struct {
+	Data SteamAppDetails `json:"data"`
+}
+
+type SteamAppDetails struct {
+	AppName  string        `json:"name"`
+	Trailers []TrailerData `json:"movies"`
 }
 
 type TrailerData struct {
-	HLSManifest string `json:"hlsManifest"`
+	HLSManifest string `json:"hls_h264"`
 }
 
 var (
 	tmpAudioFile = "audio.m4s"
 	tmpVideoFile = "video.m4s"
+
+	steamApiURL = "https://store.steampowered.com/api/appdetails"
+
+	gamePagePattern = regexp.MustCompile("^https://store.steampowered.com/app/([0-9]+)/(.*)")
 )
 
 func chooseResolution(ctx context.Context, playlists []*videoPlaylist) (*m3u8.MediaPlaylist, error) {
@@ -65,6 +72,7 @@ func chooseResolution(ctx context.Context, playlists []*videoPlaylist) (*m3u8.Me
 var (
 	gamePageUrl string
 	outputDir   string
+	steamAppID  string
 )
 
 func getCursorPos() (row int, col int, err error) {
@@ -98,23 +106,45 @@ func main() {
 
 	flag.StringVar(&gamePageUrl, "game-page", "", `url for steam game page.`)
 	flag.StringVar(&outputDir, "output-dir", getEnvString("OUTPUT_DIR", "./"), `output directory of result file. (default: ./)`)
+	flag.StringVar(&steamAppID, "app-id", "", `steam app ID of the page game. (default: empty)`)
 	flag.Parse()
 
 	if gamePageUrl == "" {
-		gamePageUrl = getEnvString("GAME_PAGE")
+		gamePageUrl = getEnvString("GAME_PAGE", "")
+	}
+
+	if gamePageUrl != "" {
+		appId, err := getSteamAppID(gamePageUrl)
+		if err != nil {
+			log.Fatal(err)
+		}
+		steamAppID = appId
+	}
+
+	if steamAppID == "" {
+		log.Fatal("didn't find any game page URL or steam app ID")
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		return runApp(ctx)
+		return runApp(ctx, steamAppID)
 	})
 	if err := g.Wait(); err != nil {
 		fmt.Printf("Unexpected error: %+v\n", err)
 	}
 }
 
-func runApp(ctx context.Context) error {
-	fm, err := SetupFileManager(gamePageUrl, tmpVideoFile, tmpAudioFile)
+func getSteamAppID(url string) (string, error) {
+	matches := gamePagePattern.FindStringSubmatch(url)
+	if len(matches) < 2 {
+		return "", errors.New("didn't find any matches for page URL")
+	}
+
+	return matches[1], nil
+}
+
+func runApp(ctx context.Context, steamAppID string) error {
+	fm, err := SetupFileManager(steamAppID, tmpVideoFile, tmpAudioFile)
 	if err != nil {
 		return fmt.Errorf("setup file manager: %w", err)
 	}
@@ -217,17 +247,17 @@ func getInputNumber(ctx context.Context, start, end int) (int, error) {
 	}
 }
 
-func chooseVideoPlaylist(ctx context.Context, options DataProps) (TrailerData, error) {
+func chooseVideoPlaylist(ctx context.Context, details SteamAppDetails) (TrailerData, error) {
 	fmt.Println("Select which video from the page you with download:")
-	for i, _ := range options.Trailers {
+	for i, _ := range details.Trailers {
 		fmt.Printf("[%d] %dº video\n", i+1, i+1)
 	}
 
-	selectedIdx, err := getInputNumber(ctx, 1, len(options.Trailers))
+	selectedIdx, err := getInputNumber(ctx, 1, len(details.Trailers))
 	if err != nil {
 		return TrailerData{}, err
 	}
-	return options.Trailers[selectedIdx-1], nil
+	return details.Trailers[selectedIdx-1], nil
 }
 
 /**
@@ -240,7 +270,7 @@ type videoPlaylist struct {
 }
 
 type Engine struct {
-	gamePageUrl      string
+	steamAppId       string
 	basePlaylistsUrl string
 	// resolution => Media Playlist Metadata
 	videoPlaylists  []*videoPlaylist
@@ -251,7 +281,7 @@ type Engine struct {
 	win             *windowTable
 }
 
-func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*Engine, error) {
+func SetupFileManager(steamAppId string, videoOutputFile, audioOutputFile string) (*Engine, error) {
 	vF, err := os.OpenFile(videoOutputFile, os.O_CREATE|os.O_RDWR, os.ModePerm)
 	if err != nil {
 		return nil, err
@@ -273,7 +303,7 @@ func SetupFileManager(gamePageUrl, videoOutputFile, audioOutputFile string) (*En
 	}
 
 	return &Engine{
-		gamePageUrl:     gamePageUrl,
+		steamAppId:      steamAppId,
 		outputVideoFile: vF,
 		outputAudioFile: aF,
 		httpClient:      c,
@@ -351,17 +381,12 @@ func (e *Engine) ExtractMasterPlaylists(ctx context.Context) error {
 }
 
 func (e *Engine) selectMasterPlaylist(ctx context.Context) (*m3u8.MasterPlaylist, error) {
-	html, err := e.downloadGamePageDocument(ctx, e.gamePageUrl)
+	appDetails, err := e.getSteamAppDetails(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := extractDataProps(html)
-	if err != nil {
-		return nil, err
-	}
-
-	selectedTrailer, err := chooseVideoPlaylist(ctx, data)
+	selectedTrailer, err := chooseVideoPlaylist(ctx, appDetails)
 	if err != nil {
 		return nil, err
 	}
@@ -400,63 +425,29 @@ func (e *Engine) downloadAndDecodeM3U8File(ctx context.Context, fileName string)
 	return paylist, nil
 }
 
-func (e *Engine) downloadGamePageDocument(ctx context.Context, url string) (*html.Node, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (e *Engine) getSteamAppDetails(ctx context.Context) (SteamAppDetails, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?appids=%s", steamApiURL, steamAppID), nil)
 	if err != nil {
-		return nil, err
+		return SteamAppDetails{}, err
 	}
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return SteamAppDetails{}, err
 	}
 
 	defer resp.Body.Close()
-	node, err := html.Parse(resp.Body)
+	var wrapper map[string]SteamAppDetailsData
+
+	err = json.NewDecoder(resp.Body).Decode(&wrapper)
 	if err != nil {
-		return nil, err
+		return SteamAppDetails{}, err
 	}
 
-	return node, nil
-}
-
-// The extraction use depth-first preorder traversal, so the elements are stored
-// in the same order as they were on HTML.
-func extractDataProps(n *html.Node) (DataProps, error) {
-	props := DataProps{Trailers: make([]TrailerData, 0)}
-
-	for d := range n.Descendants() {
-		if d.DataAtom == atom.Div && len(d.Attr) > 1 {
-			// TODO: investigate why that changed...For now just get the first elment with data-props
-			// _, is_player_div := extractAttribute(d.Attr, func(t html.Attribute) bool {
-			// 	return t.Key == "class" && t.Val == "highlight_player_item highlight_movie"
-			// })
-
-			props_attrs, has_props := extractAttribute(d.Attr, func(t html.Attribute) bool {
-				return t.Key == "data-props"
-			})
-
-			if has_props {
-				err := json.Unmarshal([]byte(props_attrs.Val), &props)
-				if err != nil {
-					return DataProps{}, err
-				}
-			}
-		}
+	data, ok := wrapper[steamAppID]
+	if !ok {
+		return SteamAppDetails{}, errors.New("can't find app details from steam API")
 	}
 
-	if len(props.Trailers) == 0 {
-		return DataProps{}, errors.New("can't find any game page trailers")
-	}
-
-	return props, nil
-}
-
-func extractAttribute(xs []html.Attribute, f func(html.Attribute) bool) (html.Attribute, bool) {
-	for _, it := range xs {
-		if f(it) {
-			return it, true
-		}
-	}
-	return html.Attribute{}, false
+	return data.Data, nil
 }
