@@ -48,42 +48,11 @@ var (
 	gamePagePattern = regexp.MustCompile("^https://store.steampowered.com/app/([0-9]+)/(.*)")
 )
 
-func chooseResolution(ctx context.Context, playlists []*videoPlaylist) (*m3u8.MediaPlaylist, error) {
-	fmt.Println("Select output resolution option:")
-
-	// sort playlist by resolution
-	slices.SortFunc(playlists, func(a, b *videoPlaylist) int {
-		aNumber, _ := strconv.Atoi(strings.SplitN(a.resolution, "x", 1)[0])
-		bNumber, _ := strconv.Atoi(strings.SplitN(b.resolution, "x", 1)[0])
-
-		return cmp.Compare(aNumber, bNumber)
-	})
-	for i, pl := range playlists {
-		fmt.Printf(" [%d] %s\n", i+1, pl.resolution)
-	}
-
-	selectedIdx, err := getInputNumber(ctx, 1, len(playlists))
-	if err != nil {
-		return nil, err
-	}
-	return playlists[selectedIdx-1].playlist, nil
-}
-
 var (
 	gamePageUrl string
 	outputDir   string
 	steamAppID  string
 )
-
-func getCursorPos() (row int, col int, err error) {
-	fmt.Printf("\033[6n\r")
-	// Expected format: ESC [ {row} ; {col} R
-	_, err = fmt.Scanf("\033[%d;%dR", &row, &col)
-	if err != nil {
-		return 0, 0, err
-	}
-	return row, col, nil
-}
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(),
@@ -122,7 +91,8 @@ func main() {
 	}
 
 	if steamAppID == "" {
-		log.Fatal("didn't find any game page URL or steam app ID")
+		fmt.Println("didn't find any game page URL or steam app ID")
+		return
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
@@ -134,22 +104,13 @@ func main() {
 	}
 }
 
-func getSteamAppID(url string) (string, error) {
-	matches := gamePagePattern.FindStringSubmatch(url)
-	if len(matches) < 2 {
-		return "", errors.New("didn't find any matches for page URL")
-	}
-
-	return matches[1], nil
-}
-
 func runApp(ctx context.Context, steamAppID string) error {
 	fm, err := SetupFileManager(steamAppID, tmpVideoFile, tmpAudioFile)
 	if err != nil {
 		return fmt.Errorf("setup file manager: %w", err)
 	}
 
-	if err := fm.ExtractMasterPlaylists(ctx); err != nil {
+	if err := fm.extractMasterPlaylists(ctx); err != nil {
 		return fmt.Errorf("extract master playlists: %w", err)
 	}
 
@@ -205,6 +166,46 @@ func runApp(ctx context.Context, steamAppID string) error {
  * Helper functions
  */
 
+func chooseResolution(ctx context.Context, playlists []*videoPlaylist) (*m3u8.MediaPlaylist, error) {
+	fmt.Println("Select output resolution option:")
+
+	// sort playlist by resolution
+	slices.SortFunc(playlists, func(a, b *videoPlaylist) int {
+		aNumber, _ := strconv.Atoi(strings.SplitN(a.resolution, "x", 1)[0])
+		bNumber, _ := strconv.Atoi(strings.SplitN(b.resolution, "x", 1)[0])
+
+		return cmp.Compare(aNumber, bNumber)
+	})
+	for i, pl := range playlists {
+		fmt.Printf(" [%d] %s\n", i+1, pl.resolution)
+	}
+
+	selectedIdx, err := getInputNumber(ctx, 1, len(playlists))
+	if err != nil {
+		return nil, err
+	}
+	return playlists[selectedIdx-1].playlist, nil
+}
+
+func getCursorPos() (row int, col int, err error) {
+	fmt.Printf("\033[6n\r")
+	// Expected format: ESC [ {row} ; {col} R
+	_, err = fmt.Scanf("\033[%d;%dR", &row, &col)
+	if err != nil {
+		return 0, 0, err
+	}
+	return row, col, nil
+}
+
+func getSteamAppID(url string) (string, error) {
+	matches := gamePagePattern.FindStringSubmatch(url)
+	if len(matches) < 2 {
+		return "", errors.New("didn't find any matches for page URL")
+	}
+
+	return matches[1], nil
+}
+
 func validateOutputPath(outPath string) (string, error) {
 	outPath = path.Clean(outPath)
 	info, err := os.Stat(outPath)
@@ -230,6 +231,9 @@ func getEnvString(name string, dft ...string) string {
 	return value
 }
 
+// TODO: when using fmt.Scanf or it's variants, we'll alwasys block the IO
+// and will not be able to handle SIGINT signals.
+// Search for an approach which allow us to cancel the read IO operation and gracefully shutdown the CLI.
 func getInputNumber(ctx context.Context, start, end int) (int, error) {
 	var optionNumber int
 	for {
@@ -348,7 +352,7 @@ func (e *Engine) mergeAndWriteFile(ctx context.Context, f io.WriteCloser, fileNa
 	return nil
 }
 
-func (e *Engine) ExtractMasterPlaylists(ctx context.Context) error {
+func (e *Engine) extractMasterPlaylists(ctx context.Context) error {
 	masterpl, err := e.selectMasterPlaylist(ctx)
 	if err != nil {
 		return err
