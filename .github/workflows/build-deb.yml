@@ -23,20 +23,33 @@ jobs:
       - name: Build DEB package
         run: nix build .#deb
 
-      - name: List build output
-        run: ls -lah result/
+      - name: Check build output structure
+        run: |
+          ls -lah result
+          file result
+          if [ -f result ]; then
+            echo "result is a file"
+            cp result steam-query.deb
+          elif [ -d result ]; then
+            echo "result is a directory"
+            find result -name "*.deb"
+          fi
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
           name: steam-query-deb-${{ github.sha }}
-          path: result/*.deb
+          path: |
+            result
+            *.deb
           if-no-files-found: error
 
       - name: Upload DEB to release (on tags)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
-          files: result/*.deb
+          files: |
+            result
+            *.deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
