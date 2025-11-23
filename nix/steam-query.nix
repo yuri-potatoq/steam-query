@@ -13,7 +13,7 @@
       in !(baseName == "result");
   };
 
-  vendorHash = "sha256-s26BHPcVqHhUmtU2sZWLWzXlglj0yICGz1OXCDXrvNI=";
+  vendorHash = "sha256-h2/e+Yipn0oZkiLCs7+nTF1wItT7OVY6MHLncnXv6lA=";
 
   nativeBuildInputs = [
     pkg-config
