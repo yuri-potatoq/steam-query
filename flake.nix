@@ -27,14 +27,17 @@
         version = "0.1.0";
       in
       {
-        packages = with pkgs; {
+        packages = with pkgs; rec {
           # just run with nix run .# -- -game-page <url>
-          default = callPackage ./nix/steam-query.nix { 
-            inherit pkgs version; 
+          default = callPackage ./nix/steam-query.nix {
+            inherit pkgs version;
             srcFiles = ./.;
           };
-          
-          deb = callPackage ./nix/deb/bundler.nix { inherit pkgs version; };
+
+          deb = callPackage ./nix/deb/bundler.nix {
+            inherit pkgs version;
+            steam-query = default;
+          };
           
           # nix bundle --bundler github:NixOS/bundlers#toDEB .#default
           bundlers.${system} = {

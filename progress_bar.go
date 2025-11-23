@@ -199,7 +199,6 @@ func (pb *progressBarBlock) Progress(percentage int) bool {
 	// skip last written position and only override remaining positions
 	// only fill positions regarding the amount positions calculated by the given percentage
 	for i := lastWrittenOffset; i < sz-1 && i < nextOffset; i++ {
-		//fmt.Printf("position to write %d\n", i)
 		pb.content[i] = pb.progressSymbol
 	}
 	pb.completed += percentage

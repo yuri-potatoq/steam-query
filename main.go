@@ -74,7 +74,7 @@ func main() {
 	}()
 
 	flag.StringVar(&gamePageUrl, "game-page", "", `url for steam game page.`)
-	flag.StringVar(&outputDir, "output-dir", getEnvString("OUTPUT_DIR", "./"), `output directory of result file. (default: ./)`)
+	flag.StringVar(&outputDir, "output-dir", getEnvString("OUTPUT_DIR", "./"), `output directory of result file.`)
 	flag.StringVar(&steamAppID, "app-id", "", `steam app ID of the page game. (default: empty)`)
 	flag.Parse()
 

@@ -1,6 +1,7 @@
 {
   pkgs ? import <nixpkgs> { },
   version,
+  steam-query,
 }: with pkgs; stdenv.mkDerivation {
   name = "steam-query_${version}_amd64.deb";
 
@@ -23,10 +24,10 @@
      Requires ca-certificates for TLS connections.
     EOF
 
-    cp ${self.packages.${system}.default}/bin/steam-query package/usr/bin/
+    cp ${steam-query}/bin/steam-query package/usr/bin/
     chmod 755 package/usr/bin/steam-query
 
     # Build .deb
-    fakeroot dpkg-deb --build package $out/${name}
+    fakeroot dpkg-deb --build package $out
   '';
 }
